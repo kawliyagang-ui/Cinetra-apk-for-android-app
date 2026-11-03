@@ -1,13 +1,10 @@
-name: Build and Release Debug APK
+name: Build and Upload Debug APK
 
 on:
   push:
     branches:
       - main
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -24,35 +21,109 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Verify Java environment
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Detect Android Project Structure and Gradle Wrapper
+        id: detect_project
         run: |
-          java -version
-          echo "JAVA_HOME=$JAVA_HOME"
-          JAVA_MAJOR=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}' | cut -d'.' -f1)
-          echo "Detected Java major version: $JAVA_MAJOR"
-          if [ -z "$JAVA_MAJOR" ]; then
-            echo "ERROR: Java major version could not be detected."
+          set -e
+          echo "Scanning for Android project directory..."
+          PROJECT_ROOT=""
+          CANDIDATES=(". " "android" "android-app")
+
+          for dir in "." "android" "android-app"; do
+            if [ -f "$dir/settings.gradle" ] || [ -f "$dir/settings.gradle.kts" ] || [ -f "$dir/build.gradle" ] || [ -f "$dir/build.gradle.kts" ]; then
+              if [ -f "$dir/gradlew" ]; then
+                PROJECT_ROOT="$dir"
+                break
+              fi
+            fi
+          done
+
+          # If not found in standard candidate directories, search up to 2 subfolder levels deep
+          if [ -z "$PROJECT_ROOT" ]; then
+            for f in $(find . -maxdepth 3 -name "gradlew" | sort); do
+              d=$(dirname "$f")
+              if [ -f "$d/settings.gradle" ] || [ -f "$d/settings.gradle.kts" ] || [ -f "$d/build.gradle" ] || [ -f "$d/build.gradle.kts" ]; then
+                PROJECT_ROOT="$d"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "::error::Android project root or Gradle wrapper (gradlew) could not be found."
             exit 1
           fi
-          if [ "$JAVA_MAJOR" -lt 17 ]; then
-            echo "ERROR: Java version must be 17 or higher. Detected: $JAVA_MAJOR"
+
+          echo "Found Android project root: $PROJECT_ROOT"
+          cd "$PROJECT_ROOT"
+
+          if [ ! -f "gradlew" ]; then
+            echo "::error::Gradle wrapper 'gradlew' not found in $PROJECT_ROOT."
             exit 1
           fi
-          echo "Java environment verified: Java $JAVA_MAJOR"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '9.3.1'
+          echo "Granting Gradle wrapper execution permissions..."
+          chmod +x gradlew
 
-      - name: Create temporary debug keystore
+          # Detect application module
+          APP_MODULE=""
+          if [ -d "app" ] && ([ -f "app/build.gradle" ] || [ -f "app/build.gradle.kts" ]); then
+            APP_MODULE="app"
+          elif [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
+            # Extract first include if available
+            DETECTED=$(grep -o -m 1 'include(":?[a-zA-Z0-9_-]\+")' settings.gradle* | head -n 1 | sed 's/include("//' | sed 's/include("://' | sed 's/")//' || true)
+            if [ -n "$DETECTED" ] && [ -d "$DETECTED" ]; then
+              APP_MODULE="$DETECTED"
+            fi
+          fi
+
+          if [ -z "$APP_MODULE" ]; then
+            # Check any subfolder with build.gradle
+            for dir in */; do
+              if [ -f "${dir}build.gradle" ] || [ -f "${dir}build.gradle.kts" ]; then
+                mod="${dir%/}"
+                if grep -q "com.android.application" "${dir}"build.gradle* 2>/dev/null; then
+                  APP_MODULE="$mod"
+                  break
+                fi
+              fi
+            done
+          fi
+
+          if [ -z "$APP_MODULE" ]; then
+            echo "::error::Could not detect the Android application module."
+            exit 1
+          fi
+
+          echo "Detected application module: $APP_MODULE"
+
+          # Export outputs
+          REAL_ROOT=$(pwd)
+          echo "project_root=$REAL_ROOT" >> "$GITHUB_OUTPUT"
+          echo "rel_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "app_module=$APP_MODULE" >> "$GITHUB_OUTPUT"
+
+      - name: Clean Stale Caches and Build Outputs
         run: |
-          if [ -f "./debug.keystore" ]; then
-            echo "./debug.keystore already exists."
+          ROOT_DIR="${{ steps.detect_project.outputs.project_root }}"
+          APP_MOD="${{ steps.detect_project.outputs.app_module }}"
+          echo "Removing stale project-level Gradle and build outputs in $ROOT_DIR..."
+          rm -rf "${ROOT_DIR}/.gradle"
+          rm -rf "${ROOT_DIR}/${APP_MOD}/build"
+          rm -rf "${ROOT_DIR}/build"
+
+      - name: Ensure Debug Keystore Exists
+        run: |
+          ROOT_DIR="${{ steps.detect_project.outputs.project_root }}"
+          if [ -f "${ROOT_DIR}/debug.keystore" ]; then
+            echo "debug.keystore already exists in $ROOT_DIR."
           else
-            echo "Generating temporary debug.keystore..."
+            echo "Generating debug keystore at ${ROOT_DIR}/debug.keystore..."
             keytool -genkey -v \
-              -keystore ./debug.keystore \
+              -keystore "${ROOT_DIR}/debug.keystore" \
               -storepass android \
               -alias androiddebugkey \
               -keypass android \
@@ -61,120 +132,55 @@ jobs:
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
           fi
-          if [ ! -f "./debug.keystore" ]; then
-            echo "ERROR: Failed to create ./debug.keystore"
-            exit 1
-          fi
-          echo "Debug keystore ready."
 
-      - name: Build debug APK
+      - name: Build Debug APK with Gradle Wrapper
         run: |
-          gradle :app:assembleDebug --stacktrace --no-daemon
+          cd "${{ steps.detect_project.outputs.project_root }}"
+          ./gradlew assembleDebug --stacktrace --no-daemon
 
-      - name: Verify debug APK
+      - name: Locate and Verify Generated APK
+        id: verify_apk
         run: |
-          TARGET_APK="app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$TARGET_APK" ]; then
-            echo "ERROR: Expected APK not found at $TARGET_APK"
-            echo "Searching only inside app/build/outputs/apk:"
-            find app/build/outputs/apk -maxdepth 3 -name "*.apk" || true
+          set -e
+          ROOT_DIR="${{ steps.detect_project.outputs.project_root }}"
+          APP_MOD="${{ steps.detect_project.outputs.app_module }}"
+          SEARCH_DIR="${ROOT_DIR}/${APP_MOD}/build/outputs/apk"
+
+          if [ ! -d "$SEARCH_DIR" ]; then
+            echo "::error::Module APK outputs directory not found at $SEARCH_DIR"
             exit 1
           fi
-          if [ ! -s "$TARGET_APK" ]; then
-            echo "ERROR: APK at $TARGET_APK is empty!"
+
+          echo "Searching for debug APK in $SEARCH_DIR..."
+          FOUND_APK=$(find "$SEARCH_DIR" -type f -name "*debug*.apk" | head -n 1)
+
+          if [ -z "$FOUND_APK" ]; then
+            echo "Fallback: Searching for any APK file in $SEARCH_DIR..."
+            FOUND_APK=$(find "$SEARCH_DIR" -type f -name "*.apk" | head -n 1)
+          fi
+
+          if [ -z "$FOUND_APK" ] || [ ! -f "$FOUND_APK" ]; then
+            echo "::error::No APK file generated in $SEARCH_DIR"
             exit 1
           fi
-          case "$TARGET_APK" in
-            *.apk) echo "Verified valid APK: $TARGET_APK" ;;
-            *) echo "ERROR: File does not have .apk extension"; exit 1 ;;
+
+          if [ ! -s "$FOUND_APK" ]; then
+            echo "::error::Generated APK file $FOUND_APK is empty (0 bytes)."
+            exit 1
+          fi
+
+          case "$FOUND_APK" in
+            *.apk) echo "Verified valid APK: $FOUND_APK" ;;
+            *) echo "::error::File $FOUND_APK is missing .apk extension"; exit 1 ;;
           esac
 
-      - name: Upload debug APK artifact
+          APK_SIZE=$(du -h "$FOUND_APK" | cut -f1)
+          echo "Found valid APK: $FOUND_APK (Size: $APK_SIZE)"
+          echo "apk_path=$FOUND_APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: android-app-debug-apk
+          path: ${{ steps.verify_apk.outputs.apk_path }}
           if-no-files-found: error
-
-      - name: Prepare APK release asset
-        id: prep_asset
-        run: |
-          TEMP_RELEASE_DIR=$(mktemp -d)
-          cp app/build/outputs/apk/debug/app-debug.apk "${TEMP_RELEASE_DIR}/app-debug.apk"
-          if [ ! -f "${TEMP_RELEASE_DIR}/app-debug.apk" ]; then
-            echo "ERROR: Failed to copy APK to temporary release directory."
-            exit 1
-          fi
-          echo "asset_path=${TEMP_RELEASE_DIR}/app-debug.apk" >> "$GITHUB_OUTPUT"
-
-      - name: Publish APK to GitHub Releases
-        id: publish_release
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh --version
-          RELEASE_ASSET="${{ steps.prep_asset.outputs.asset_path }}"
-          if [ ! -f "$RELEASE_ASSET" ]; then
-            echo "ERROR: Release asset $RELEASE_ASSET not found."
-            exit 1
-          fi
-          if [ ! -s "$RELEASE_ASSET" ]; then
-            echo "ERROR: Release asset $RELEASE_ASSET is empty."
-            exit 1
-          fi
-          ASSET_NAME=$(basename "$RELEASE_ASSET")
-          if [ "$ASSET_NAME" != "app-debug.apk" ]; then
-            echo "ERROR: Release asset filename must be app-debug.apk, got: $ASSET_NAME"
-            exit 1
-          fi
-
-          TAG_NAME="debug-apk-build-${{ github.run_number }}-${{ github.run_attempt }}"
-          TITLE="Debug APK Build #${{ github.run_number }}"
-
-          NOTES=$(cat <<EOF
-          ### Automated Debug APK Release
-          - **Build Type**: Automatically generated debug APK
-          - **Built by**: GitHub Actions
-          - **Run Number**: ${{ github.run_number }}
-          - **Run Attempt**: ${{ github.run_attempt }}
-          - **Commit SHA**: \`${{ github.sha }}\`
-          - **Notice**: This APK is intended for testing and development. It is not a Play Store production release and is signed only with a temporary debug keystore.
-          EOF
-          )
-
-          gh release create "$TAG_NAME" "$RELEASE_ASSET" \
-            --title "$TITLE" \
-            --notes "$NOTES" \
-            --target "${{ github.sha }}" \
-            --latest
-
-      - name: Report APK download result
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "${{ steps.publish_release.outcome }}" = "success" ]; then
-            TAG_NAME="debug-apk-build-${{ github.run_number }}-${{ github.run_attempt }}"
-            echo "GitHub Release published successfully."
-            gh release view "$TAG_NAME" || true
-            echo "Release Tag: $TAG_NAME"
-            echo "Release Title: Debug APK Build #${{ github.run_number }}"
-            echo "APK Filename: app-debug.apk"
-            DIRECT_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/app-debug.apk"
-            echo "Direct Download URL: $DIRECT_URL"
-
-            echo "## DIRECT APK DOWNLOAD" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Direct link to download the latest debug APK:" >> "$GITHUB_STEP_SUMMARY"
-            echo "[$DIRECT_URL]($DIRECT_URL)" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "The GitHub Actions artifact **app-debug-apk** remains available as a backup." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "WARNING: GitHub Release publishing did not complete successfully."
-            if [ "${{ steps.upload-artifact.outcome }}" = "success" ] || [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
-              echo "The debug APK was built successfully."
-              echo "The GitHub Actions backup artifact 'app-debug-apk' remains available."
-            fi
-            echo "Notice: Do not use the direct latest-release link until a successful release is created."
-          fi
