@@ -1,0 +1,6 @@
+{
+  "name": "Cinetra",
+  "description": "Cinetra: Movie and TV Series streaming app featuring Trending titles, TMDb search, custom video player embedding, Watchlist, Continue Watching, and an Admin Management Panel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
